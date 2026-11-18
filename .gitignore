@@ -1,0 +1,15 @@
+# Build output
+/terraform-provider-clara
+/dist/
+
+# Test and editor files
+*.test
+*.out
+.idea/
+.vscode/
+
+# Terraform files produced by local runs
+.terraform/
+*.tfstate
+*.tfstate.*
+crash.log
