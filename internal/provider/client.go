@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -18,17 +17,21 @@ const (
 	maxResponseBytes = 4 << 20
 	maxRetries       = 3
 	maxRetryAfter    = 30 * time.Second
+
+	onboardPath = "/api/v1/aws/onboarding"
 )
 
 // apiClient talks to the Clara public API. The API wraps successful responses as
 // {"data": ...} and failures as {"error": {"code", "message", "request_id"}}.
+//
+// It exposes exactly one operation, creating an integration. The API key this provider is
+// meant for can do nothing else, so there is no read, update or delete call to add.
 type apiClient struct {
 	baseURL      string
 	apiKey       string
 	userAgent    string
 	http         *http.Client
 	retryBackoff time.Duration
-	pollInterval time.Duration
 }
 
 // apiError is a non-2xx response from Clara.
@@ -61,165 +64,75 @@ func statusOf(err error) int {
 	return 0
 }
 
-// flexString decodes a JSON string or number into a string. Clara client ids are
-// numbers internally and may be serialized either way.
-type flexString string
-
-func (f *flexString) UnmarshalJSON(b []byte) error {
-	trimmed := strings.TrimSpace(string(b))
-	if trimmed == "null" {
-		*f = ""
-		return nil
-	}
-	if strings.HasPrefix(trimmed, "\"") {
-		var s string
-		if err := json.Unmarshal(b, &s); err != nil {
-			return err
-		}
-		*f = flexString(s)
-		return nil
-	}
-	var n json.Number
-	if err := json.Unmarshal(b, &n); err != nil {
-		return err
-	}
-	*f = flexString(n.String())
-	return nil
+type onboardCur struct {
+	BucketName string `json:"bucketName"`
+	ReportName string `json:"reportName,omitempty"`
+	S3Prefix   string `json:"s3Prefix,omitempty"`
 }
 
-type contextResponse struct {
-	ClientID       flexString `json:"client_id"`
-	OrganizationID flexString `json:"organization_id"`
+type onboardCur2 struct {
+	Enabled    bool   `json:"enabled"`
+	ExportName string `json:"exportName,omitempty"`
+	S3Prefix   string `json:"s3Prefix,omitempty"`
 }
 
-// awsIntegrationRequest is the body for create and update. It never comes back in a
-// response: external_id is write-only on the server side.
-type awsIntegrationRequest struct {
-	PayerAccountID string `json:"payer_account_id,omitempty"`
-	Name           string `json:"name,omitempty"`
-	Method         string `json:"method,omitempty"`
-	PermissionMode string `json:"permission_mode"`
-	RoleArn        string `json:"role_arn"`
-	ExternalID     string `json:"external_id"`
-	CurBucketName  string `json:"cur_bucket_name"`
-	CurReportName  string `json:"cur_report_name,omitempty"`
-	CurS3Prefix    string `json:"cur_s3_prefix,omitempty"`
-	Cur2Enabled    bool   `json:"cur2_enabled"`
-	Cur2ExportName string `json:"cur2_export_name,omitempty"`
-	Cur2S3Prefix   string `json:"cur2_s3_prefix,omitempty"`
+// onboardRequest is the body of POST /v1/aws/onboarding. The ExternalId is write-only: Clara
+// never returns it.
+type onboardRequest struct {
+	PayerAccountID string       `json:"payerAccountId"`
+	Name           string       `json:"name,omitempty"`
+	RoleArn        string       `json:"roleArn"`
+	ExternalID     string       `json:"externalId"`
+	PermissionMode string       `json:"permissionMode"`
+	Cur            onboardCur   `json:"cur"`
+	Cur2           *onboardCur2 `json:"cur2,omitempty"`
 }
 
-type awsIntegration struct {
-	ID             flexString `json:"id"`
-	Status         string     `json:"status"`
-	PayerAccountID string     `json:"payer_account_id"`
-	Name           string     `json:"name"`
-	PermissionMode string     `json:"permission_mode"`
-	RoleArn        string     `json:"role_arn"`
-	CurBucketName  string     `json:"cur_bucket_name"`
-	CurReportName  string     `json:"cur_report_name"`
-	CurS3Prefix    string     `json:"cur_s3_prefix"`
-	Cur2Enabled    bool       `json:"cur2_enabled"`
-	Cur2ExportName string     `json:"cur2_export_name"`
-	Cur2S3Prefix   string     `json:"cur2_s3_prefix"`
+type onboardVerification struct {
+	// State is verified, partial, failed or unavailable.
+	State          string   `json:"state"`
+	RoleAssumption string   `json:"roleAssumption"`
+	FailedChecks   []string `json:"failedChecks"`
+	Message        *string  `json:"message"`
 }
 
-type verifyResponse struct {
-	Status string `json:"status"`
+type onboardResult struct {
+	ID             string              `json:"id"`
+	Status         string              `json:"status"`
+	Name           string              `json:"name"`
+	PayerAccountID string              `json:"payerAccountId"`
+	Verification   onboardVerification `json:"verification"`
 }
 
-func (c *apiClient) getContext(ctx context.Context) (*contextResponse, error) {
-	var out contextResponse
-	if err := c.do(ctx, http.MethodGet, "/api/v1/aws/context", nil, nil, &out); err != nil {
+// onboardAccount registers one payer account. idempotencyKey makes a retry after a lost
+// response return the first result instead of registering twice.
+func (c *apiClient) onboardAccount(ctx context.Context, in onboardRequest, idempotencyKey string) (*onboardResult, error) {
+	var out onboardResult
+	if err := c.post(ctx, onboardPath, idempotencyKey, in, &out); err != nil {
 		return nil, err
 	}
 	return &out, nil
 }
 
-// findIntegration returns the integration for a payer account, or nil.
-func (c *apiClient) findIntegration(ctx context.Context, payerAccountID string) (*awsIntegration, error) {
-	q := url.Values{"payerAccountId": []string{payerAccountID}}
-	var out []awsIntegration
-	if err := c.do(ctx, http.MethodGet, "/api/v1/aws/integrations", q, nil, &out); err != nil {
-		return nil, err
-	}
-	for i := range out {
-		if out[i].PayerAccountID == payerAccountID {
-			return &out[i], nil
-		}
-	}
-	return nil, nil
-}
-
-func (c *apiClient) createIntegration(ctx context.Context, in awsIntegrationRequest) (*awsIntegration, error) {
-	var out awsIntegration
-	if err := c.do(ctx, http.MethodPost, "/api/v1/aws/integrations", nil, in, &out); err != nil {
-		return nil, err
-	}
-	return &out, nil
-}
-
-func (c *apiClient) getIntegration(ctx context.Context, id string) (*awsIntegration, error) {
-	var out awsIntegration
-	if err := c.do(ctx, http.MethodGet, "/api/v1/aws/integrations/"+url.PathEscape(id), nil, nil, &out); err != nil {
-		return nil, err
-	}
-	return &out, nil
-}
-
-func (c *apiClient) updateIntegration(ctx context.Context, id string, in awsIntegrationRequest) (*awsIntegration, error) {
-	// The payer account and method are fixed once an integration exists.
-	in.PayerAccountID = ""
-	in.Method = ""
-	var out awsIntegration
-	if err := c.do(ctx, http.MethodPatch, "/api/v1/aws/integrations/"+url.PathEscape(id), nil, in, &out); err != nil {
-		return nil, err
-	}
-	return &out, nil
-}
-
-func (c *apiClient) verifyIntegration(ctx context.Context, id string) (string, error) {
-	var out verifyResponse
-	if err := c.do(ctx, http.MethodPost, "/api/v1/aws/integrations/"+url.PathEscape(id)+"/verify-sa", nil, nil, &out); err != nil {
-		return "", err
-	}
-	return out.Status, nil
-}
-
-func (c *apiClient) disconnectIntegration(ctx context.Context, id string) error {
-	return c.do(ctx, http.MethodPost, "/api/v1/aws/integrations/"+url.PathEscape(id)+"/disconnect", nil, nil, nil)
-}
-
-// do sends one request, retrying on 429 and 503. out may be nil.
-func (c *apiClient) do(ctx context.Context, method, path string, query url.Values, body, out any) error {
+// post sends one POST, retrying on 429 and 503 with the same Idempotency-Key.
+func (c *apiClient) post(ctx context.Context, path, idempotencyKey string, body, out any) error {
 	target := strings.TrimRight(c.baseURL, "/") + path
-	if len(query) > 0 {
-		target += "?" + query.Encode()
-	}
 
-	var payload []byte
-	if body != nil {
-		var err error
-		if payload, err = json.Marshal(body); err != nil {
-			return fmt.Errorf("encoding request: %w", err)
-		}
+	payload, err := json.Marshal(body)
+	if err != nil {
+		return fmt.Errorf("encoding request: %w", err)
 	}
 
 	for attempt := 0; ; attempt++ {
-		var reader io.Reader
-		if payload != nil {
-			reader = bytes.NewReader(payload)
-		}
-		req, err := http.NewRequestWithContext(ctx, method, target, reader)
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, target, bytes.NewReader(payload))
 		if err != nil {
 			return err
 		}
 		req.Header.Set("Authorization", "Bearer "+c.apiKey)
 		req.Header.Set("Accept", "application/json")
+		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("User-Agent", c.userAgent)
-		if payload != nil {
-			req.Header.Set("Content-Type", "application/json")
-		}
+		req.Header.Set("Idempotency-Key", idempotencyKey)
 
 		resp, err := c.http.Do(req)
 		if err != nil {
@@ -250,9 +163,7 @@ func (c *apiClient) do(ctx context.Context, method, path string, query url.Value
 		if resp.StatusCode >= 400 {
 			return parseAPIError(resp.StatusCode, raw)
 		}
-		if out == nil || resp.StatusCode == http.StatusNoContent || len(bytes.TrimSpace(raw)) == 0 {
-			return nil
-		}
+
 		var envelope struct {
 			Data json.RawMessage `json:"data"`
 		}

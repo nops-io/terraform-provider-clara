@@ -1,107 +1,99 @@
 # Clara API contract used by this provider
 
-Status: **proposed**. The provider and its tests (`internal/provider/fake_clara_test.go`) are written against this contract.
+The provider calls **one** Clara endpoint. The API key it uses can do nothing else.
 
-All routes live under `/api/v1/aws` on the Clara API host (`https://api.nops.io`).
+All requests go to the Clara API host (`https://api.nops.io`).
+
+## Authentication
+
+`Authorization: Bearer <Clara API key>`. The key needs the **`aws-onboarding:create`** permission and nothing else.
+
+That permission is accepted by this endpoint and by no other. A key that holds only it cannot read, change or delete
+anything in Clara, including integrations it created itself. Create the key in Clara under **Settings → Security → API Keys** and
+select only that permission.
+
+The organization must have access to the Clara public API, the same as for any other API key.
 
 ## Conventions
 
-- **Auth:** `Authorization: Bearer <Clara API key>`. Reads need `aws-onboarding:read`. Writes need `aws-onboarding:write`. The key's owner must
-  be a Clara admin, the same rule the wizard enforces. Every route is scoped to the key's organization; another organization's ids return `404`.
 - **Success:** `{ "data": ... }`.
 - **Error:** `{ "error": { "code": "...", "message": "...", "request_id": "..." } }`. `429` carries `Retry-After`.
-- **IDs:** ids may be strings or numbers. The provider reads both.
-- **Secrets:** `external_id` is accepted on write and **never returned**. Do not log it.
-- **Audit:** every write is recorded with the API key id.
+- **Idempotency:** `Idempotency-Key` is required. A retry with the same key returns the first response instead of registering again.
+- **Secrets:** `externalId` is accepted and **never returned**.
+- **Audit:** every registration is recorded with the API key id.
 
-## Integration object
+## `POST /v1/aws/onboarding`
 
-```json
-{
-  "id": "int_123",
-  "status": "active",
-  "payer_account_id": "123456789012",
-  "name": "AWS Account 123456789012",
-  "permission_mode": "minimal",
-  "role_arn": "arn:aws:iam::123456789012:role/nops-integration-role-42",
-  "cur_bucket_name": "nops-cur-42",
-  "cur_report_name": "nops_cur_42_hourly",
-  "cur_s3_prefix": "nops-cur",
-  "cur2_enabled": true,
-  "cur2_export_name": "nops_cur2_42_hourly",
-  "cur2_s3_prefix": "nops-cur2"
-}
-```
-
-`status` is one of: `validating` (created, not yet verified), `active`, `awaiting_customer_setup` (verification failed), `error`, `disconnected`.
-These are the values Clara's `verify-sa` already produces, plus `disconnected`.
-
-## Routes
-
-### `GET /api/v1/aws/context`
-
-Scope: read. Returns the key's organization.
-
-```json
-{ "data": { "client_id": 42, "organization_id": "org_abc" } }
-```
-
-### `GET /api/v1/aws/integrations?payerAccountId=123456789012`
-
-Scope: read. `{ "data": [ <integration> ] }`. Excludes `disconnected` integrations. Empty list when none.
-
-### `POST /api/v1/aws/integrations`
-
-Scope: write. Body (all values are strings unless noted):
+Registers one payer account and runs Clara's Savings Analysis access check.
 
 ```json
 {
-  "payer_account_id": "123456789012",
+  "payerAccountId": "123456789012",
   "name": "optional",
-  "method": "terraform",
-  "permission_mode": "minimal",
-  "role_arn": "arn:aws:iam::123456789012:role/nops-integration-role-42",
-  "external_id": "11111111-2222-3333-4444-555555555555",
-  "cur_bucket_name": "nops-cur-42",
-  "cur_report_name": "optional",
-  "cur_s3_prefix": "optional",
-  "cur2_enabled": true,
-  "cur2_export_name": "optional",
-  "cur2_s3_prefix": "optional"
+  "roleArn": "arn:aws:iam::123456789012:role/nops-integration-role-42",
+  "externalId": "11111111-2222-3333-4444-555555555555",
+  "permissionMode": "minimal",
+  "cur": { "bucketName": "nops-cur-42", "reportName": "optional", "s3Prefix": "optional" },
+  "cur2": { "enabled": true, "exportName": "optional", "s3Prefix": "optional" }
 }
 ```
 
-- Omitted optional values take the wizard's suggested defaults (`nops_cur_<client id>_hourly`, `nops-cur`, `nops_cur2_<client id>_hourly`, `nops-cur2`).
-- `201` with the integration, status `validating`.
-- `409` with code `integration_exists` when the payer account already has a non-disconnected integration. The provider then looks it up and calls `PATCH`.
-- `400` for invalid input. `method` must be `terraform`.
+- Unknown fields are rejected.
+- `roleArn` must be a role in `payerAccountId`.
+- Omitted optional values take the setup wizard's defaults (`nops_cur_<client id>_hourly`, `nops-cur`, `nops_cur2_<client id>_hourly`, `nops-cur2`). CUR 2.0 uses the CUR bucket unless `cur2.bucketName` is given.
+- `permissionMode` is `minimal` or `full` and defaults to `minimal`.
 
-### `GET /api/v1/aws/integrations/{id}`
+`201`:
 
-Scope: read. `200` with the integration, or `404`.
+```json
+{
+  "data": {
+    "id": "clx123",
+    "status": "active",
+    "name": "AWS Account 123456789012",
+    "payerAccountId": "123456789012",
+    "verification": {
+      "state": "verified",
+      "roleAssumption": "ok",
+      "failedChecks": [],
+      "message": null
+    }
+  }
+}
+```
 
-### `PATCH /api/v1/aws/integrations/{id}`
+`verification.state`:
 
-Scope: write. Same body fields as `POST`, except `payer_account_id` and `method`, which are fixed. Resets `status` to `validating`. `200` with the integration.
+| State | Meaning | `status` |
+|---|---|---|
+| `verified` | Role assumed, all checks passed | `active` |
+| `partial` | Savings Analysis checks failed, cost and usage ingest works | `active` |
+| `failed` | The role could not be assumed, or ingest permissions are missing | `awaiting_customer_setup` |
+| `unavailable` | The check could not run | `validating` |
 
-### `POST /api/v1/aws/integrations/{id}/verify-sa`
+A freshly created role may not be assumable for a few seconds. Clara retries that failure up to three times before reporting `failed`.
 
-Scope: write. Runs the same access check as the setup wizard's Verify step and returns `{ "data": { "status": "active" } }`. The status is also stored.
-`validating` means the check is still in progress; the provider then polls `GET` until the status settles or its timeout passes.
+Errors:
 
-### `POST /api/v1/aws/integrations/{id}/disconnect`
+| Status | Code | When |
+|---|---|---|
+| `400` | `invalid_request` | The body is invalid. The message names the field. |
+| `400` | `missing_idempotency_key` | No `Idempotency-Key` header. |
+| `401` | `invalid_credentials` | The key is invalid. |
+| `403` | `forbidden_scope` | The key lacks `aws-onboarding:create`. |
+| `403` | `forbidden_tenant` | The organization is not set up for API access. |
+| `409` | `already_exists` | The payer account already has an integration. The response says nothing else about it. |
+| `429` | `quota_exceeded` / `rate_limited` | Too many registrations. Default cap: 50 per key per day. |
 
-Scope: write. Marks the integration `disconnected` and stops ingestion. Does not touch AWS. `204` with no body. A second call returns `204` or `404`.
+A payer account whose earlier integration ended in `error` can be registered again. Any other existing integration returns `409`.
 
-## What the provider does with these
+## What the provider does with it
 
 | Provider action | Calls |
 |---|---|
-| `data.clara_context` read | `GET /context` |
-| Create | `POST /integrations`; on `409`: `GET /integrations?payerAccountId=` then `PATCH`. Then `POST .../verify-sa`, polling `GET` while `validating` |
-| Read | `GET /integrations/{id}`; `404` or status `disconnected` removes it from state |
-| Update | `PATCH`, then verify |
-| Destroy | `POST .../disconnect` |
-| Import | `GET /integrations/{id}` |
+| Create | `POST /v1/aws/onboarding`, retrying `429` and `503` up to three times with the same `Idempotency-Key` |
+| Read, plan, refresh | none |
+| Update | none. A changed argument is refused at plan time. |
+| Destroy | none. The integration stays in Clara. |
 
-Retries: `429` and `503`, up to three times, honoring `Retry-After` (capped at 30 seconds).
+There is no import: the key cannot read integrations.

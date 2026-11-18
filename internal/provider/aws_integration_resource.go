@@ -2,19 +2,17 @@ package provider
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"net/http"
 	"regexp"
 	"strings"
-	"time"
 
-	"github.com/hashicorp/terraform-plugin-framework-validators/int64validator"
 	"github.com/hashicorp/terraform-plugin-framework-validators/stringvalidator"
-	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
-	"github.com/hashicorp/terraform-plugin-framework/resource/schema/booldefault"
-	"github.com/hashicorp/terraform-plugin-framework/resource/schema/int64default"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema/listplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/schema/validator"
@@ -22,13 +20,15 @@ import (
 )
 
 var (
-	_ resource.Resource                = &awsIntegrationResource{}
-	_ resource.ResourceWithConfigure   = &awsIntegrationResource{}
-	_ resource.ResourceWithImportState = &awsIntegrationResource{}
+	_ resource.Resource               = &awsIntegrationResource{}
+	_ resource.ResourceWithConfigure  = &awsIntegrationResource{}
+	_ resource.ResourceWithModifyPlan = &awsIntegrationResource{}
 
 	accountIDPattern = regexp.MustCompile(`^[0-9]{12}$`)
 	roleArnPattern   = regexp.MustCompile(`^arn:aws:iam::[0-9]{12}:role/.+$`)
 	bucketPattern    = regexp.MustCompile(`^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$`)
+	namePattern      = regexp.MustCompile(`^[A-Za-z0-9_-]{1,128}$`)
+	prefixPattern    = regexp.MustCompile(`^[0-9A-Za-z._/-]+$`)
 )
 
 // NewAwsIntegrationResource returns clara_aws_integration.
@@ -37,20 +37,21 @@ func NewAwsIntegrationResource() resource.Resource { return &awsIntegrationResou
 type awsIntegrationResource struct{ client *apiClient }
 
 type awsIntegrationModel struct {
-	ID                         types.String `tfsdk:"id"`
-	PayerAccountID             types.String `tfsdk:"payer_account_id"`
-	Name                       types.String `tfsdk:"name"`
-	PermissionMode             types.String `tfsdk:"permission_mode"`
-	RoleArn                    types.String `tfsdk:"role_arn"`
-	ExternalID                 types.String `tfsdk:"external_id"`
-	CurBucketName              types.String `tfsdk:"cur_bucket_name"`
-	CurReportName              types.String `tfsdk:"cur_report_name"`
-	CurS3Prefix                types.String `tfsdk:"cur_s3_prefix"`
-	Cur2ExportName             types.String `tfsdk:"cur2_export_name"`
-	Cur2S3Prefix               types.String `tfsdk:"cur2_s3_prefix"`
-	WaitForVerification        types.Bool   `tfsdk:"wait_for_verification"`
-	VerificationTimeoutSeconds types.Int64  `tfsdk:"verification_timeout_seconds"`
-	Status                     types.String `tfsdk:"status"`
+	ID                  types.String `tfsdk:"id"`
+	PayerAccountID      types.String `tfsdk:"payer_account_id"`
+	Name                types.String `tfsdk:"name"`
+	PermissionMode      types.String `tfsdk:"permission_mode"`
+	RoleArn             types.String `tfsdk:"role_arn"`
+	ExternalID          types.String `tfsdk:"external_id"`
+	CurBucketName       types.String `tfsdk:"cur_bucket_name"`
+	CurReportName       types.String `tfsdk:"cur_report_name"`
+	CurS3Prefix         types.String `tfsdk:"cur_s3_prefix"`
+	Cur2ExportName      types.String `tfsdk:"cur2_export_name"`
+	Cur2S3Prefix        types.String `tfsdk:"cur2_s3_prefix"`
+	Status              types.String `tfsdk:"status"`
+	VerificationState   types.String `tfsdk:"verification_state"`
+	VerificationMessage types.String `tfsdk:"verification_message"`
+	FailedChecks        types.List   `tfsdk:"failed_checks"`
 }
 
 func (r *awsIntegrationResource) Metadata(_ context.Context, req resource.MetadataRequest, resp *resource.MetadataResponse) {
@@ -59,20 +60,22 @@ func (r *awsIntegrationResource) Metadata(_ context.Context, req resource.Metada
 
 func (r *awsIntegrationResource) Schema(_ context.Context, _ resource.SchemaRequest, resp *resource.SchemaResponse) {
 	str := func(m ...planmodifier.String) []planmodifier.String { return m }
+	keep := str(stringplanmodifier.UseStateForUnknown())
 
 	resp.Schema = schema.Schema{
 		Description: "Registers an AWS payer account with Clara after the AWS resources exist (see the nops-io/clara-onboarding/aws module). " +
-			"Destroying this resource disconnects the integration in Clara. It does not delete anything in AWS.",
+			"This resource only creates. The API key it uses cannot read, change or delete anything in Clara, so a plan does not " +
+			"compare against Clara, a changed argument is refused, and destroying the resource only forgets it: the integration stays " +
+			"in Clara until you disconnect it there.",
 		Attributes: map[string]schema.Attribute{
 			"id": schema.StringAttribute{
 				Computed:      true,
 				Description:   "Clara integration id.",
-				PlanModifiers: str(stringplanmodifier.UseStateForUnknown()),
+				PlanModifiers: keep,
 			},
 			"payer_account_id": schema.StringAttribute{
-				Required:      true,
-				Description:   "12-digit payer (management) account id. Changing it creates a new integration.",
-				PlanModifiers: str(stringplanmodifier.RequiresReplace()),
+				Required:    true,
+				Description: "12-digit payer (management) account id.",
 				Validators: []validator.String{
 					stringvalidator.RegexMatches(accountIDPattern, "must be a 12-digit AWS account id"),
 				},
@@ -81,7 +84,7 @@ func (r *awsIntegrationResource) Schema(_ context.Context, _ resource.SchemaRequ
 				Optional:      true,
 				Computed:      true,
 				Description:   "Name shown in Clara. Defaults to \"AWS Account <id>\".",
-				PlanModifiers: str(stringplanmodifier.UseStateForUnknown()),
+				PlanModifiers: keep,
 			},
 			"permission_mode": schema.StringAttribute{
 				Required:    true,
@@ -90,7 +93,7 @@ func (r *awsIntegrationResource) Schema(_ context.Context, _ resource.SchemaRequ
 			},
 			"role_arn": schema.StringAttribute{
 				Required:    true,
-				Description: "ARN of the integration role created by the onboarding module.",
+				Description: "ARN of the integration role created by the onboarding module. It must be a role in the payer account.",
 				Validators: []validator.String{
 					stringvalidator.RegexMatches(roleArnPattern, "must be an IAM role ARN"),
 				},
@@ -109,43 +112,54 @@ func (r *awsIntegrationResource) Schema(_ context.Context, _ resource.SchemaRequ
 				},
 			},
 			"cur_report_name": schema.StringAttribute{
-				Optional:      true,
-				Computed:      true,
-				Description:   "Legacy CUR report name. Defaults to nops_cur_<client id>_hourly.",
-				PlanModifiers: str(stringplanmodifier.UseStateForUnknown()),
+				Optional:    true,
+				Description: "Legacy CUR report name. When unset, Clara uses nops_cur_<client id>_hourly.",
+				Validators: []validator.String{
+					stringvalidator.RegexMatches(namePattern, "may contain letters, digits, underscores and hyphens"),
+				},
 			},
 			"cur_s3_prefix": schema.StringAttribute{
-				Optional:      true,
-				Computed:      true,
-				Description:   "Legacy CUR S3 prefix. Defaults to nops-cur.",
-				PlanModifiers: str(stringplanmodifier.UseStateForUnknown()),
+				Optional:    true,
+				Description: "Legacy CUR S3 prefix. When unset, Clara uses nops-cur.",
+				Validators: []validator.String{
+					stringvalidator.RegexMatches(prefixPattern, "may contain letters, digits, dots, underscores, slashes and hyphens"),
+				},
 			},
 			"cur2_export_name": schema.StringAttribute{
 				Optional:    true,
 				Description: "CUR 2.0 export name. Setting it turns CUR 2.0 on for the integration.",
+				Validators: []validator.String{
+					stringvalidator.RegexMatches(namePattern, "may contain letters, digits, underscores and hyphens"),
+				},
 			},
 			"cur2_s3_prefix": schema.StringAttribute{
-				Optional:      true,
-				Computed:      true,
-				Description:   "CUR 2.0 S3 prefix. Defaults to nops-cur2.",
-				PlanModifiers: str(stringplanmodifier.UseStateForUnknown()),
-			},
-			"wait_for_verification": schema.BoolAttribute{
 				Optional:    true,
-				Computed:    true,
-				Default:     booldefault.StaticBool(true),
-				Description: "Run Clara's access verification after create and update, and fail unless the integration becomes active. Defaults to true.",
-			},
-			"verification_timeout_seconds": schema.Int64Attribute{
-				Optional:    true,
-				Computed:    true,
-				Default:     int64default.StaticInt64(300),
-				Description: "How long to wait for verification. Defaults to 300.",
-				Validators:  []validator.Int64{int64validator.Between(30, 3600)},
+				Description: "CUR 2.0 S3 prefix. When unset, Clara uses nops-cur2.",
+				Validators: []validator.String{
+					stringvalidator.RegexMatches(prefixPattern, "may contain letters, digits, dots, underscores, slashes and hyphens"),
+				},
 			},
 			"status": schema.StringAttribute{
-				Computed:    true,
-				Description: "Integration status in Clara, for example active, validating or awaiting_customer_setup.",
+				Computed:      true,
+				Description:   "Integration status when it was created: active, validating or awaiting_customer_setup. It is not refreshed.",
+				PlanModifiers: keep,
+			},
+			"verification_state": schema.StringAttribute{
+				Computed: true,
+				Description: "Result of Clara's access check at creation: verified, partial (Savings Analysis checks failed but cost and usage " +
+					"ingest works), failed, or unavailable (the check could not run). It is not refreshed.",
+				PlanModifiers: keep,
+			},
+			"verification_message": schema.StringAttribute{
+				Computed:      true,
+				Description:   "Why the role could not be assumed, when that was the failure.",
+				PlanModifiers: keep,
+			},
+			"failed_checks": schema.ListAttribute{
+				Computed:      true,
+				ElementType:   types.StringType,
+				Description:   "Permission checks that failed at creation. Empty when everything passed.",
+				PlanModifiers: []planmodifier.List{listplanmodifier.UseStateForUnknown()},
 			},
 		},
 	}
@@ -163,102 +177,81 @@ func (r *awsIntegrationResource) Configure(_ context.Context, req resource.Confi
 	r.client = client
 }
 
-func (m *awsIntegrationModel) toRequest() awsIntegrationRequest {
-	cur2 := strings.TrimSpace(m.Cur2ExportName.ValueString())
-	return awsIntegrationRequest{
+// ModifyPlan refuses a change to an existing integration at plan time. The API key cannot update,
+// and replacing would create a second integration for the same payer account, which Clara refuses.
+func (r *awsIntegrationResource) ModifyPlan(ctx context.Context, req resource.ModifyPlanRequest, resp *resource.ModifyPlanResponse) {
+	if req.State.Raw.IsNull() || req.Plan.Raw.IsNull() {
+		return
+	}
+
+	var plan, state awsIntegrationModel
+	resp.Diagnostics.Append(req.Plan.Get(ctx, &plan)...)
+	resp.Diagnostics.Append(req.State.Get(ctx, &state)...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+
+	var changed []string
+	check := func(name string, planned, current types.String) {
+		if planned.IsUnknown() {
+			return
+		}
+		if planned.ValueString() != current.ValueString() || planned.IsNull() != current.IsNull() {
+			changed = append(changed, name)
+		}
+	}
+	check("payer_account_id", plan.PayerAccountID, state.PayerAccountID)
+	check("permission_mode", plan.PermissionMode, state.PermissionMode)
+	check("role_arn", plan.RoleArn, state.RoleArn)
+	check("external_id", plan.ExternalID, state.ExternalID)
+	check("cur_bucket_name", plan.CurBucketName, state.CurBucketName)
+	check("cur_report_name", plan.CurReportName, state.CurReportName)
+	check("cur_s3_prefix", plan.CurS3Prefix, state.CurS3Prefix)
+	check("cur2_export_name", plan.Cur2ExportName, state.Cur2ExportName)
+	check("cur2_s3_prefix", plan.Cur2S3Prefix, state.Cur2S3Prefix)
+	// A name left unset keeps the one Clara chose.
+	if !plan.Name.IsNull() {
+		check("name", plan.Name, state.Name)
+	}
+
+	if len(changed) > 0 {
+		resp.Diagnostics.AddError(
+			"Clara integrations cannot be changed from Terraform",
+			fmt.Sprintf(
+				"%s changed for payer account %s. The API key used by this provider can only create integrations, so it cannot update "+
+					"this one, and creating it again would be refused because the account is already connected. Change the integration "+
+					"in Clara, then put the original values back here.",
+				strings.Join(changed, ", "), state.PayerAccountID.ValueString(),
+			),
+		)
+	}
+}
+
+func (m *awsIntegrationModel) toRequest() onboardRequest {
+	req := onboardRequest{
 		PayerAccountID: m.PayerAccountID.ValueString(),
 		Name:           m.Name.ValueString(),
-		PermissionMode: m.PermissionMode.ValueString(),
 		RoleArn:        m.RoleArn.ValueString(),
 		ExternalID:     m.ExternalID.ValueString(),
-		CurBucketName:  m.CurBucketName.ValueString(),
-		CurReportName:  m.CurReportName.ValueString(),
-		CurS3Prefix:    m.CurS3Prefix.ValueString(),
-		Cur2Enabled:    cur2 != "",
-		Cur2ExportName: cur2,
-		Cur2S3Prefix:   m.Cur2S3Prefix.ValueString(),
+		PermissionMode: m.PermissionMode.ValueString(),
+		Cur: onboardCur{
+			BucketName: m.CurBucketName.ValueString(),
+			ReportName: m.CurReportName.ValueString(),
+			S3Prefix:   m.CurS3Prefix.ValueString(),
+		},
 	}
+	if export := strings.TrimSpace(m.Cur2ExportName.ValueString()); export != "" {
+		req.Cur2 = &onboardCur2{Enabled: true, ExportName: export, S3Prefix: m.Cur2S3Prefix.ValueString()}
+	}
+	return req
 }
 
-// valueIfUnknown keeps a configured value and fills a computed one from the server.
-func valueIfUnknown(current types.String, server string) types.String {
-	if current.IsUnknown() || current.IsNull() {
-		return types.StringValue(server)
+func newIdempotencyKey() (string, error) {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
 	}
-	return current
-}
-
-// applyServerValues records what Clara returned after create or update without
-// overriding anything the user configured.
-func (m *awsIntegrationModel) applyServerValues(in *awsIntegration) {
-	m.ID = types.StringValue(string(in.ID))
-	m.Status = types.StringValue(in.Status)
-	m.Name = valueIfUnknown(m.Name, in.Name)
-	m.CurReportName = valueIfUnknown(m.CurReportName, in.CurReportName)
-	m.CurS3Prefix = valueIfUnknown(m.CurS3Prefix, in.CurS3Prefix)
-	m.Cur2S3Prefix = valueIfUnknown(m.Cur2S3Prefix, in.Cur2S3Prefix)
-}
-
-// refreshFromServer overwrites state with Clara's view so drift shows up in plans.
-func (m *awsIntegrationModel) refreshFromServer(in *awsIntegration) {
-	m.ID = types.StringValue(string(in.ID))
-	m.Status = types.StringValue(in.Status)
-	m.PayerAccountID = types.StringValue(in.PayerAccountID)
-	m.Name = types.StringValue(in.Name)
-	m.PermissionMode = types.StringValue(in.PermissionMode)
-	m.RoleArn = types.StringValue(in.RoleArn)
-	m.CurBucketName = types.StringValue(in.CurBucketName)
-	m.CurReportName = types.StringValue(in.CurReportName)
-	m.CurS3Prefix = types.StringValue(in.CurS3Prefix)
-	m.Cur2S3Prefix = types.StringValue(in.Cur2S3Prefix)
-	if in.Cur2Enabled {
-		m.Cur2ExportName = types.StringValue(in.Cur2ExportName)
-	} else {
-		m.Cur2ExportName = types.StringNull()
-	}
-}
-
-// verify runs Clara's check and waits for a final status. It updates m.Status.
-func (r *awsIntegrationResource) verify(ctx context.Context, m *awsIntegrationModel) error {
-	if !m.WaitForVerification.ValueBool() {
-		return nil
-	}
-	timeout := time.Duration(m.VerificationTimeoutSeconds.ValueInt64()) * time.Second
-	ctx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-
-	id := m.ID.ValueString()
-	status, err := r.client.verifyIntegration(ctx, id)
-	if err != nil {
-		return fmt.Errorf("running verification: %w", err)
-	}
-
-	for {
-		m.Status = types.StringValue(status)
-		switch status {
-		case "active":
-			return nil
-		case "validating", "pending", "":
-			// Still being checked: keep polling.
-		default:
-			return fmt.Errorf("verification finished with status %q. Clara could not confirm access to the account. Open the integration in Clara to see which checks failed, fix them, and apply again", status)
-		}
-
-		select {
-		case <-ctx.Done():
-			return fmt.Errorf("the integration is still %q after %s. Apply again, or set wait_for_verification = false", status, timeout)
-		case <-time.After(r.client.pollInterval):
-		}
-
-		current, err := r.client.getIntegration(ctx, id)
-		if err != nil {
-			if ctx.Err() != nil {
-				return fmt.Errorf("the integration is still %q after %s. Apply again, or set wait_for_verification = false", status, timeout)
-			}
-			return fmt.Errorf("checking the integration status: %w", err)
-		}
-		status = current.Status
-	}
+	return hex.EncodeToString(b), nil
 }
 
 func (r *awsIntegrationResource) Create(ctx context.Context, req resource.CreateRequest, resp *resource.CreateResponse) {
@@ -268,115 +261,102 @@ func (r *awsIntegrationResource) Create(ctx context.Context, req resource.Create
 		return
 	}
 
-	body := plan.toRequest()
-	body.Method = "terraform"
-
-	integration, err := r.client.createIntegration(ctx, body)
+	// One key per create. The client reuses it across retries, so a lost response cannot register twice.
+	key, err := newIdempotencyKey()
 	if err != nil {
-		if statusOf(err) != http.StatusConflict {
+		resp.Diagnostics.AddError("Could not create an idempotency key", err.Error())
+		return
+	}
+
+	result, err := r.client.onboardAccount(ctx, plan.toRequest(), key)
+	if err != nil {
+		switch statusOf(err) {
+		case http.StatusConflict:
+			resp.Diagnostics.AddError(
+				"Clara already has an integration for this account",
+				fmt.Sprintf(
+					"Payer account %s is already connected. This provider's API key can only create integrations, so it cannot adopt or "+
+						"change the existing one. If it was onboarded on purpose, remove this resource from the configuration. If it is a "+
+						"leftover, disconnect it in Clara first. (%s)",
+					plan.PayerAccountID.ValueString(), err,
+				),
+			)
+		case http.StatusForbidden:
+			resp.Diagnostics.AddError(
+				"The Clara API key is not allowed to onboard accounts",
+				"The key needs the aws-onboarding:create permission, and the organization needs API access. "+err.Error(),
+			)
+		default:
 			resp.Diagnostics.AddError("Could not create the Clara integration", err.Error())
-			return
 		}
-		// One integration per payer account. Take over the existing one.
-		existing, findErr := r.client.findIntegration(ctx, plan.PayerAccountID.ValueString())
-		if findErr != nil || existing == nil {
-			detail := "Clara says an integration already exists for this payer account, but it could not be looked up."
-			if findErr != nil {
-				detail += " " + findErr.Error()
-			}
-			resp.Diagnostics.AddError("Could not adopt the existing Clara integration", detail)
-			return
-		}
-		integration, err = r.client.updateIntegration(ctx, string(existing.ID), body)
-		if err != nil {
-			resp.Diagnostics.AddError("Could not update the existing Clara integration", err.Error())
-			return
-		}
+		return
+	}
+
+	checks := result.Verification.FailedChecks
+	if checks == nil {
+		checks = []string{}
+	}
+	failed, diags := types.ListValueFrom(ctx, types.StringType, checks)
+	resp.Diagnostics.Append(diags...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+
+	plan.ID = types.StringValue(result.ID)
+	plan.Status = types.StringValue(result.Status)
+	plan.Name = types.StringValue(result.Name)
+	plan.VerificationState = types.StringValue(result.Verification.State)
+	plan.FailedChecks = failed
+	plan.VerificationMessage = types.StringValue("")
+	if result.Verification.Message != nil {
+		plan.VerificationMessage = types.StringValue(*result.Verification.Message)
+	}
+
+	// The integration exists now, so keep it in state whatever the verification said. Failing here
+	// would taint the resource, and applying again would be refused as a duplicate.
+	resp.Diagnostics.Append(resp.State.Set(ctx, plan)...)
+
+	switch result.Verification.State {
+	case "verified":
+	case "partial":
 		resp.Diagnostics.AddWarning(
-			"Adopted an existing Clara integration",
-			fmt.Sprintf("Payer account %s already had Clara integration %s. It now follows this configuration.", plan.PayerAccountID.ValueString(), existing.ID),
+			"Clara could only partly verify the integration",
+			fmt.Sprintf("Cost and usage ingest works, but these Savings Analysis checks failed: %s. Open the integration in Clara for details.", strings.Join(result.Verification.FailedChecks, ", ")),
+		)
+	case "failed":
+		detail := "Clara could not confirm access to the account. The integration was created and is waiting for setup. Open it in Clara to see which checks failed and to verify again."
+		if result.Verification.Message != nil && *result.Verification.Message != "" {
+			detail += " Clara reported: " + *result.Verification.Message
+		}
+		resp.Diagnostics.AddWarning("Clara could not verify the integration", detail)
+	default:
+		resp.Diagnostics.AddWarning(
+			"Clara could not run its access check",
+			"The integration was created. Open it in Clara and verify it from there.",
 		)
 	}
-
-	plan.applyServerValues(integration)
-	// Save before verifying so a failed verification taints the resource instead of losing it.
-	resp.Diagnostics.Append(resp.State.Set(ctx, plan)...)
-	if resp.Diagnostics.HasError() {
-		return
-	}
-
-	if err := r.verify(ctx, &plan); err != nil {
-		resp.Diagnostics.AddError("Clara could not verify the integration", err.Error())
-	}
-	resp.Diagnostics.Append(resp.State.Set(ctx, plan)...)
 }
 
-func (r *awsIntegrationResource) Read(ctx context.Context, req resource.ReadRequest, resp *resource.ReadResponse) {
-	var state awsIntegrationModel
-	resp.Diagnostics.Append(req.State.Get(ctx, &state)...)
-	if resp.Diagnostics.HasError() {
-		return
-	}
-
-	integration, err := r.client.getIntegration(ctx, state.ID.ValueString())
-	if err != nil {
-		if statusOf(err) == http.StatusNotFound {
-			resp.State.RemoveResource(ctx)
-			return
-		}
-		resp.Diagnostics.AddError("Could not read the Clara integration", err.Error())
-		return
-	}
-	if integration.Status == "disconnected" {
-		resp.State.RemoveResource(ctx)
-		return
-	}
-
-	state.refreshFromServer(integration)
-	resp.Diagnostics.Append(resp.State.Set(ctx, state)...)
+// Read keeps the state as it is. The API key cannot read integrations, so there is nothing to compare against.
+func (r *awsIntegrationResource) Read(_ context.Context, _ resource.ReadRequest, _ *resource.ReadResponse) {
 }
 
-func (r *awsIntegrationResource) Update(ctx context.Context, req resource.UpdateRequest, resp *resource.UpdateResponse) {
-	var plan, state awsIntegrationModel
-	resp.Diagnostics.Append(req.Plan.Get(ctx, &plan)...)
-	resp.Diagnostics.Append(req.State.Get(ctx, &state)...)
-	if resp.Diagnostics.HasError() {
-		return
-	}
-	plan.ID = state.ID
-
-	integration, err := r.client.updateIntegration(ctx, state.ID.ValueString(), plan.toRequest())
-	if err != nil {
-		resp.Diagnostics.AddError("Could not update the Clara integration", err.Error())
-		return
-	}
-
-	plan.applyServerValues(integration)
-	resp.Diagnostics.Append(resp.State.Set(ctx, plan)...)
-	if resp.Diagnostics.HasError() {
-		return
-	}
-
-	if err := r.verify(ctx, &plan); err != nil {
-		resp.Diagnostics.AddError("Clara could not verify the integration", err.Error())
-	}
-	resp.Diagnostics.Append(resp.State.Set(ctx, plan)...)
+// Update is unreachable: ModifyPlan refuses every change.
+func (r *awsIntegrationResource) Update(_ context.Context, _ resource.UpdateRequest, resp *resource.UpdateResponse) {
+	resp.Diagnostics.AddError("Clara integrations cannot be changed from Terraform", "This provider's API key can only create integrations.")
 }
 
+// Delete forgets the resource. The API key cannot delete or disconnect anything.
 func (r *awsIntegrationResource) Delete(ctx context.Context, req resource.DeleteRequest, resp *resource.DeleteResponse) {
 	var state awsIntegrationModel
 	resp.Diagnostics.Append(req.State.Get(ctx, &state)...)
-	if resp.Diagnostics.HasError() {
-		return
-	}
 
-	if err := r.client.disconnectIntegration(ctx, state.ID.ValueString()); err != nil && statusOf(err) != http.StatusNotFound {
-		resp.Diagnostics.AddError("Could not disconnect the Clara integration", err.Error())
-	}
-}
-
-func (r *awsIntegrationResource) ImportState(ctx context.Context, req resource.ImportStateRequest, resp *resource.ImportStateResponse) {
-	resource.ImportStatePassthroughID(ctx, path.Root("id"), req, resp)
-	resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("wait_for_verification"), true)...)
-	resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("verification_timeout_seconds"), int64(300))...)
+	resp.Diagnostics.AddWarning(
+		"The integration stays in Clara",
+		fmt.Sprintf(
+			"Terraform stopped tracking payer account %s. The API key used by this provider cannot disconnect it, so it is still connected in Clara. "+
+				"Disconnect it in Clara if it should go. Nothing was deleted in AWS.",
+			state.PayerAccountID.ValueString(),
+		),
+	)
 }

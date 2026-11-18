@@ -4,7 +4,7 @@ Terraform provider that registers AWS accounts with [nOps Clara](https://nops.io
 
 It is the headless counterpart of Clara's setup wizard. The AWS resources themselves are created by the
 [`nops-io/clara-onboarding/aws`](https://github.com/nops-io/terraform-aws-clara-onboarding) module. This provider only tells Clara
-about them and waits for Clara's verification.
+about them and reports Clara's verification.
 
 ## Using it
 
@@ -21,7 +21,6 @@ terraform {
 # The API key comes from CLARA_API_KEY. Do not put it in configuration files.
 provider "clara" {}
 
-data "clara_context" "this" {}
 ```
 
 Most users do not write `clara_aws_integration` directly. They use the module's `modules/registration`, which wraps it.
@@ -33,22 +32,27 @@ Most users do not write `clara_aws_integration` directly. They use the module's 
 | `api_key` | `CLARA_API_KEY` | none, required |
 | `api_base_url` | `CLARA_API_URL` | `https://api.nops.io` |
 
-The API key needs the `aws-onboarding:read` and `aws-onboarding:write` permissions, and its owner must be a Clara admin. The provider
-refuses `http://` URLs except for localhost, so the key is never sent in clear text. The key is not stored in Terraform state.
+Create the key in Clara under **Settings → Security → API Keys** and give it **only** the `aws-onboarding:create` permission. That
+permission registers a new account and nothing else: the key cannot read, change or delete anything in Clara. The provider refuses
+`http://` URLs except for localhost, so the key is never sent in clear text, and the key is not stored in Terraform state.
 
 ## Resources
 
-- `clara_aws_integration`: registers a payer account. Destroying it disconnects the integration in Clara and does **not** delete anything in AWS.
-- `data.clara_context`: the Clara client id and organization for the API key.
+- `clara_aws_integration`: registers a payer account.
 
 See `docs/`.
 
 ## Behavior to know
 
-- **One integration per payer account.** If Clara already has one, the provider adopts it and updates it to match the configuration, with a warning. You do not need to import first.
-- **Verification.** After create and update the provider asks Clara to verify access, then waits for the status to become `active`. It fails on `awaiting_customer_setup` and on timeout. Set `wait_for_verification = false` to skip.
-- **Failed verification keeps the resource.** The integration exists in Clara, so Terraform marks the resource tainted. Fix the cause and apply again; the adopt path makes that safe.
-- **Import.** `terraform import clara_aws_integration.this <integration id>`. `external_id` is write-only, so the next plan sends it.
+This provider is **create-only**, because its API key is. That has consequences:
+
+- **No drift detection.** Plan and refresh make no requests to Clara. The state is what you applied, not what Clara has now.
+- **A changed argument is refused** at plan time, with a message. Change the integration in Clara instead.
+- **Destroy only forgets the resource.** The integration stays in Clara and nothing in AWS is deleted. Disconnect it in Clara if it should go.
+- **No import.**
+- **One integration per payer account.** If Clara already has one, create fails with a clear message. The provider cannot adopt it.
+- **Verification is a warning.** Clara checks access when it creates the integration and reports `verification_state`. A failed check does not fail the apply,
+  because the integration already exists and a tainted resource could not be recreated. Check the attribute, then verify from Clara.
 
 ## API contract
 
@@ -62,7 +66,8 @@ Needs Go 1.25 or newer and a `terraform` binary on `PATH` (the tests run the pro
 make test
 ```
 
-The tests use an in-memory fake of the Clara API (`internal/provider/fake_clara_test.go`). No network or credentials are needed.
+The tests use an in-memory fake of the Clara endpoint (`internal/provider/fake_clara_test.go`) that also records every request, so they can prove
+the provider sends one create and nothing else. No network or credentials are needed.
 
 To try a local build in a configuration, add a development override to your CLI config:
 

@@ -5,37 +5,37 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
-	"strings"
 	"sync"
 	"testing"
 )
 
 const testAPIKey = "test-key"
 
-// fakeClara implements the proposed Clara AWS onboarding API in memory.
+// fakeClara implements the create-only Clara onboarding endpoint in memory. It records every
+// request so tests can prove the provider sends nothing else.
 type fakeClara struct {
 	t      *testing.T
 	server *httptest.Server
 
-	mu    sync.Mutex
-	items map[string]*awsIntegration
-	next  int
-	log   []string
+	mu       sync.Mutex
+	payers   map[string]string // payer account id -> integration id
+	next     int
+	requests []string
+	bodies   []onboardRequest
+	keys     []string
 
-	// verifyStatus is the status verify-sa produces. If it is "validating", the
-	// integration turns active after validatingPolls GET requests.
-	verifyStatus    string
-	validatingPolls int
-	pollsLeft       map[string]int
+	// verification is what the permission check reports for the next create.
+	verification onboardVerification
+	status       string
 }
 
 func newFakeClara(t *testing.T) *fakeClara {
 	t.Helper()
 	f := &fakeClara{
 		t:            t,
-		items:        map[string]*awsIntegration{},
-		verifyStatus: "active",
-		pollsLeft:    map[string]int{},
+		payers:       map[string]string{},
+		status:       "active",
+		verification: onboardVerification{State: "verified", RoleAssumption: "ok", FailedChecks: []string{}},
 	}
 	f.server = httptest.NewServer(http.HandlerFunc(f.handle))
 	t.Cleanup(f.server.Close)
@@ -44,37 +44,27 @@ func newFakeClara(t *testing.T) *fakeClara {
 
 func (f *fakeClara) url() string { return f.server.URL }
 
-func (f *fakeClara) saw(entry string) bool {
+// requestLog returns "METHOD path" for every request received, in order.
+func (f *fakeClara) requestLog() []string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	for _, l := range f.log {
-		if l == entry {
-			return true
-		}
-	}
-	return false
+	return append([]string(nil), f.requests...)
 }
 
-func (f *fakeClara) status(id string) string {
+func (f *fakeClara) lastBody() onboardRequest {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if it, ok := f.items[id]; ok {
-		return it.Status
+	if len(f.bodies) == 0 {
+		f.t.Fatalf("no create request was received")
 	}
-	return ""
+	return f.bodies[len(f.bodies)-1]
 }
 
-func (f *fakeClara) seed(payer string) string {
+func (f *fakeClara) seed(payer string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.next++
-	id := fmt.Sprintf("int-%d", f.next)
-	f.items[id] = &awsIntegration{
-		ID: flexString(id), Status: "validating", PayerAccountID: payer, Name: "Existing",
-		PermissionMode: "minimal", RoleArn: "arn:aws:iam::" + payer + ":role/old", CurBucketName: "old-bucket",
-		CurReportName: "old_report", CurS3Prefix: "old-prefix",
-	}
-	return id
+	f.payers[payer] = fmt.Sprintf("int-%d", f.next)
 }
 
 func writeJSON(w http.ResponseWriter, status int, body any) {
@@ -90,109 +80,51 @@ func writeError(w http.ResponseWriter, status int, code, message string) {
 func (f *fakeClara) handle(w http.ResponseWriter, r *http.Request) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.log = append(f.log, r.Method+" "+r.URL.Path)
+	f.requests = append(f.requests, r.Method+" "+r.URL.Path)
 
 	if r.Header.Get("Authorization") != "Bearer "+testAPIKey {
-		writeError(w, http.StatusUnauthorized, "invalid_credentials", "bad key")
+		writeError(w, http.StatusUnauthorized, "invalid_credentials", "Invalid API key")
+		return
+	}
+	// Create-only: the real endpoint has no other method or path.
+	if r.Method != http.MethodPost || r.URL.Path != onboardPath {
+		writeError(w, http.StatusNotFound, "not_found", "Resource not found")
+		return
+	}
+	key := r.Header.Get("Idempotency-Key")
+	if key == "" {
+		writeError(w, http.StatusBadRequest, "missing_idempotency_key", "Idempotency-Key header is required for this request")
+		return
+	}
+	f.keys = append(f.keys, key)
+
+	var req onboardRequest
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_request", "Invalid request body")
+		return
+	}
+	f.bodies = append(f.bodies, req)
+
+	if _, exists := f.payers[req.PayerAccountID]; exists {
+		writeError(w, http.StatusConflict, "already_exists", "An integration for this AWS account already exists")
 		return
 	}
 
-	path := strings.TrimPrefix(r.URL.Path, "/api/v1/aws")
-	switch {
-	case path == "/context" && r.Method == http.MethodGet:
-		// The client id is a number in Clara; the provider must accept it.
-		writeJSON(w, 200, map[string]any{"data": map[string]any{"client_id": 42, "organization_id": "org_abc"}})
+	f.next++
+	id := fmt.Sprintf("int-%d", f.next)
+	f.payers[req.PayerAccountID] = id
 
-	case path == "/integrations" && r.Method == http.MethodGet:
-		payer := r.URL.Query().Get("payerAccountId")
-		out := []*awsIntegration{}
-		for _, it := range f.items {
-			if it.PayerAccountID == payer && it.Status != "disconnected" {
-				out = append(out, it)
-			}
-		}
-		writeJSON(w, 200, map[string]any{"data": out})
-
-	case path == "/integrations" && r.Method == http.MethodPost:
-		var req awsIntegrationRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			writeError(w, 400, "invalid_request", err.Error())
-			return
-		}
-		if req.Method != "terraform" {
-			writeError(w, 400, "invalid_request", "method must be terraform")
-			return
-		}
-		for _, it := range f.items {
-			if it.PayerAccountID == req.PayerAccountID && it.Status != "disconnected" {
-				writeError(w, http.StatusConflict, "integration_exists", "already onboarded")
-				return
-			}
-		}
-		f.next++
-		id := fmt.Sprintf("int-%d", f.next)
-		it := &awsIntegration{ID: flexString(id), Status: "validating", PayerAccountID: req.PayerAccountID}
-		f.apply(it, req)
-		f.items[id] = it
-		writeJSON(w, 201, map[string]any{"data": it})
-
-	case strings.HasPrefix(path, "/integrations/"):
-		rest := strings.TrimPrefix(path, "/integrations/")
-		id, action, _ := strings.Cut(rest, "/")
-		it, ok := f.items[id]
-		if !ok {
-			writeError(w, 404, "not_found", "no such integration")
-			return
-		}
-		switch {
-		case action == "" && r.Method == http.MethodGet:
-			if f.pollsLeft[id] > 0 {
-				f.pollsLeft[id]--
-				if f.pollsLeft[id] == 0 {
-					it.Status = "active"
-				}
-			}
-			writeJSON(w, 200, map[string]any{"data": it})
-		case action == "" && r.Method == http.MethodPatch:
-			var req awsIntegrationRequest
-			_ = json.NewDecoder(r.Body).Decode(&req)
-			f.apply(it, req)
-			writeJSON(w, 200, map[string]any{"data": it})
-		case action == "verify-sa" && r.Method == http.MethodPost:
-			it.Status = f.verifyStatus
-			if f.verifyStatus == "validating" {
-				f.pollsLeft[id] = f.validatingPolls
-			}
-			writeJSON(w, 200, map[string]any{"data": map[string]any{"status": it.Status}})
-		case action == "disconnect" && r.Method == http.MethodPost:
-			it.Status = "disconnected"
-			w.WriteHeader(http.StatusNoContent)
-		default:
-			writeError(w, 405, "method_not_allowed", "no route")
-		}
-
-	default:
-		writeError(w, 404, "not_found", "no route")
+	name := req.Name
+	if name == "" {
+		name = "AWS Account " + req.PayerAccountID
 	}
+	writeJSON(w, http.StatusCreated, map[string]any{"data": onboardResult{
+		ID:             id,
+		Status:         f.status,
+		Name:           name,
+		PayerAccountID: req.PayerAccountID,
+		Verification:   f.verification,
+	}})
 }
-
-// apply copies request fields, filling the defaults Clara's wizard suggests.
-func (f *fakeClara) apply(it *awsIntegration, req awsIntegrationRequest) {
-	it.PermissionMode = req.PermissionMode
-	it.RoleArn = req.RoleArn
-	it.CurBucketName = req.CurBucketName
-	it.Name = firstNonEmpty(req.Name, it.Name, "AWS Account "+it.PayerAccountID)
-	it.CurReportName = firstNonEmpty(req.CurReportName, it.CurReportName, "nops_cur_42_hourly")
-	it.CurS3Prefix = firstNonEmpty(req.CurS3Prefix, it.CurS3Prefix, "nops-cur")
-	it.Cur2Enabled = req.Cur2Enabled
-	if req.Cur2Enabled {
-		it.Cur2ExportName = req.Cur2ExportName
-		it.Cur2S3Prefix = firstNonEmpty(req.Cur2S3Prefix, "nops-cur2")
-	} else {
-		it.Cur2ExportName = ""
-		it.Cur2S3Prefix = ""
-	}
-	it.Status = "validating"
-}
-
-func jsonUnmarshal(s string, v any) error { return json.Unmarshal([]byte(s), v) }

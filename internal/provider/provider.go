@@ -26,8 +26,7 @@ var _ provider.Provider = &claraProvider{}
 type claraProvider struct {
 	version string
 
-	// Test hooks. Zero means the production default.
-	pollInterval time.Duration
+	// Test hook. Zero means the production default.
 	retryBackoff time.Duration
 }
 
@@ -50,7 +49,7 @@ func (p *claraProvider) Metadata(_ context.Context, _ provider.MetadataRequest, 
 
 func (p *claraProvider) Schema(_ context.Context, _ provider.SchemaRequest, resp *provider.SchemaResponse) {
 	resp.Schema = schema.Schema{
-		Description: "Registers AWS accounts with nOps Clara. Authenticate with a Clara API key that has the aws-onboarding permissions.",
+		Description: "Registers AWS accounts with nOps Clara. Authenticate with a Clara API key that has only the aws-onboarding:create permission. That key can register new accounts and cannot read, change or delete anything.",
 		Attributes: map[string]schema.Attribute{
 			"api_base_url": schema.StringAttribute{
 				Optional:    true,
@@ -103,14 +102,12 @@ func (p *claraProvider) Configure(ctx context.Context, req provider.ConfigureReq
 		userAgent:    fmt.Sprintf("%s/%s", userAgentName, p.version),
 		http:         &http.Client{Timeout: 60 * time.Second},
 		retryBackoff: orDuration(p.retryBackoff, time.Second),
-		pollInterval: orDuration(p.pollInterval, 5*time.Second),
 	}
-	resp.DataSourceData = client
 	resp.ResourceData = client
 }
 
 func (p *claraProvider) DataSources(_ context.Context) []func() datasource.DataSource {
-	return []func() datasource.DataSource{NewContextDataSource}
+	return nil
 }
 
 func (p *claraProvider) Resources(_ context.Context) []func() resource.Resource {
