@@ -59,7 +59,7 @@ resource "clara_aws_integration" "test" {
 `, extra)
 }
 
-const onlyCreate = "POST /api/v1/aws/onboarding"
+const onlyCreate = "POST /v1/aws/onboarding"
 
 func TestAwsIntegration_createsOnceAndNeverReadsChangesOrDeletes(t *testing.T) {
 	fake := newFakeClara(t)
