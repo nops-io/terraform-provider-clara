@@ -18,7 +18,7 @@ const (
 	maxRetries       = 3
 	maxRetryAfter    = 30 * time.Second
 
-	onboardPath = "/api/v1/aws/onboarding"
+	onboardPath = "/v1/aws/onboarding"
 )
 
 // apiClient talks to the Clara public API. The API wraps successful responses as
