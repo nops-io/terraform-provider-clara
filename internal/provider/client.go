@@ -17,8 +17,13 @@ const (
 	maxResponseBytes = 4 << 20
 	maxRetries       = 3
 	maxRetryAfter    = 30 * time.Second
+	// While the first attempt with a key is still running, Clara answers 409 idempotency_conflict.
+	// Clara finishes a request within 60 seconds, so waiting this many times covers it.
+	maxInFlightWaits = 12
 
 	onboardPath = "/v1/aws/onboarding"
+
+	idempotencyConflictCode = "idempotency_conflict"
 )
 
 // apiClient talks to the Clara public API. The API wraps successful responses as
@@ -104,8 +109,8 @@ type onboardResult struct {
 	Verification   onboardVerification `json:"verification"`
 }
 
-// onboardAccount registers one payer account. idempotencyKey makes a retry after a lost
-// response return the first result instead of registering twice.
+// onboardAccount registers one payer account. Clara stores the response under idempotencyKey,
+// so a retry after a lost response returns the first result instead of registering twice.
 func (c *apiClient) onboardAccount(ctx context.Context, in onboardRequest, idempotencyKey string) (*onboardResult, error) {
 	var out onboardResult
 	if err := c.post(ctx, onboardPath, idempotencyKey, in, &out); err != nil {
@@ -114,7 +119,11 @@ func (c *apiClient) onboardAccount(ctx context.Context, in onboardRequest, idemp
 	return &out, nil
 }
 
-// post sends one POST, retrying on 429 and 503 with the same Idempotency-Key.
+// post sends one POST and retries with the same Idempotency-Key when a retry is safe and
+// useful: the response was lost (network error, 502, 504) or Clara is busy (429, 503). While
+// the first attempt with this key is still running (409 idempotency_conflict) it waits for it
+// to finish, up to maxInFlightWaits times. Clara replays a
+// completed response for a repeated key, so a retry never registers twice.
 func (c *apiClient) post(ctx context.Context, path, idempotencyKey string, body, out any) error {
 	target := strings.TrimRight(c.baseURL, "/") + path
 
@@ -123,45 +132,37 @@ func (c *apiClient) post(ctx context.Context, path, idempotencyKey string, body,
 		return fmt.Errorf("encoding request: %w", err)
 	}
 
+	inFlightWaits := 0
 	for attempt := 0; ; attempt++ {
-		req, err := http.NewRequestWithContext(ctx, http.MethodPost, target, bytes.NewReader(payload))
+		status, raw, header, err := c.send(ctx, target, idempotencyKey, payload)
 		if err != nil {
-			return err
-		}
-		req.Header.Set("Authorization", "Bearer "+c.apiKey)
-		req.Header.Set("Accept", "application/json")
-		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("User-Agent", c.userAgent)
-		req.Header.Set("Idempotency-Key", idempotencyKey)
-
-		resp, err := c.http.Do(req)
-		if err != nil {
-			return fmt.Errorf("calling Clara: %w", err)
-		}
-		raw, readErr := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes))
-		_ = resp.Body.Close()
-		if readErr != nil {
-			return fmt.Errorf("reading Clara response: %w", readErr)
+			if ctx.Err() != nil || attempt >= maxRetries {
+				return err
+			}
+			if waitErr := c.wait(ctx, attempt, nil); waitErr != nil {
+				return waitErr
+			}
+			continue
 		}
 
-		if (resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode == http.StatusServiceUnavailable) && attempt < maxRetries {
-			wait := c.retryBackoff * time.Duration(attempt+1)
-			if secs, convErr := strconv.Atoi(resp.Header.Get("Retry-After")); convErr == nil && secs > 0 {
-				wait = time.Duration(secs) * time.Second
-			}
-			if wait > maxRetryAfter {
-				wait = maxRetryAfter
-			}
-			select {
-			case <-time.After(wait):
+		if status >= 400 {
+			apiErr := parseAPIError(status, raw)
+			if isInFlight(status, apiErr) && inFlightWaits < maxInFlightWaits {
+				// Not a failure of this attempt, so it does not use up a retry.
+				inFlightWaits++
+				attempt--
+				if waitErr := c.sleep(ctx, 5*c.retryBackoff); waitErr != nil {
+					return waitErr
+				}
 				continue
-			case <-ctx.Done():
-				return ctx.Err()
 			}
-		}
-
-		if resp.StatusCode >= 400 {
-			return parseAPIError(resp.StatusCode, raw)
+			if attempt < maxRetries && isRetryable(status, apiErr) {
+				if waitErr := c.wait(ctx, attempt, header); waitErr != nil {
+					return waitErr
+				}
+				continue
+			}
+			return apiErr
 		}
 
 		var envelope struct {
@@ -177,6 +178,77 @@ func (c *apiClient) post(ctx context.Context, path, idempotencyKey string, body,
 			return fmt.Errorf("decoding Clara response data: %w", err)
 		}
 		return nil
+	}
+}
+
+// send makes one attempt. A non-nil error means no usable response arrived.
+func (c *apiClient) send(ctx context.Context, target, idempotencyKey string, payload []byte) (int, []byte, http.Header, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, target, bytes.NewReader(payload))
+	if err != nil {
+		return 0, nil, nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+c.apiKey)
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", c.userAgent)
+	req.Header.Set("Idempotency-Key", idempotencyKey)
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return 0, nil, nil, fmt.Errorf("calling Clara: %w", err)
+	}
+	raw, readErr := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes))
+	_ = resp.Body.Close()
+	if readErr != nil {
+		return 0, nil, nil, fmt.Errorf("reading Clara response: %w", readErr)
+	}
+	return resp.StatusCode, raw, resp.Header, nil
+}
+
+// isRetryable reports whether repeating the request could succeed. A daily quota does not
+// reset within the retry window, so quota_exceeded fails at once.
+func isRetryable(status int, err error) bool {
+	code := ""
+	var apiErr *apiError
+	if errors.As(err, &apiErr) {
+		code = apiErr.Code
+	}
+	switch status {
+	case http.StatusTooManyRequests:
+		return code != "quota_exceeded"
+	case http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+		return true
+	}
+	return false
+}
+
+// isInFlight reports Clara's answer for a key whose first request has not finished yet.
+func isInFlight(status int, err error) bool {
+	var apiErr *apiError
+	return status == http.StatusConflict && errors.As(err, &apiErr) && apiErr.Code == idempotencyConflictCode
+}
+
+// wait sleeps before the next attempt: linear backoff, or Retry-After in seconds when the
+// response sent one, capped at maxRetryAfter.
+func (c *apiClient) wait(ctx context.Context, attempt int, header http.Header) error {
+	wait := c.retryBackoff * time.Duration(attempt+1)
+	if header != nil {
+		if secs, convErr := strconv.Atoi(header.Get("Retry-After")); convErr == nil && secs > 0 {
+			wait = time.Duration(secs) * time.Second
+		}
+	}
+	if wait > maxRetryAfter {
+		wait = maxRetryAfter
+	}
+	return c.sleep(ctx, wait)
+}
+
+func (c *apiClient) sleep(ctx context.Context, d time.Duration) error {
+	select {
+	case <-time.After(d):
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 }
 

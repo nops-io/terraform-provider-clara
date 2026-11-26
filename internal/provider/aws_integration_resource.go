@@ -270,8 +270,15 @@ func (r *awsIntegrationResource) Create(ctx context.Context, req resource.Create
 
 	result, err := r.client.onboardAccount(ctx, plan.toRequest(), key)
 	if err != nil {
-		switch statusOf(err) {
-		case http.StatusConflict:
+		switch {
+		case isInFlight(statusOf(err), err):
+			resp.Diagnostics.AddError(
+				"Clara is still processing the registration",
+				"An earlier attempt for payer account "+plan.PayerAccountID.ValueString()+" did not finish in time. It may still "+
+					"create the integration. Check the integration in Clara before running apply again; if it was created, remove "+
+					"this resource from the configuration. ("+err.Error()+")",
+			)
+		case statusOf(err) == http.StatusConflict:
 			resp.Diagnostics.AddError(
 				"Clara already has an integration for this account",
 				fmt.Sprintf(
@@ -281,7 +288,7 @@ func (r *awsIntegrationResource) Create(ctx context.Context, req resource.Create
 					plan.PayerAccountID.ValueString(), err,
 				),
 			)
-		case http.StatusForbidden:
+		case statusOf(err) == http.StatusForbidden:
 			resp.Diagnostics.AddError(
 				"The Clara API key is not allowed to onboard accounts",
 				"The key needs the aws-onboarding:create permission, and the organization needs API access. "+err.Error(),

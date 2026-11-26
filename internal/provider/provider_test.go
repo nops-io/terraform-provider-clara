@@ -382,6 +382,95 @@ func TestClient_givesUpAfterRetries(t *testing.T) {
 	}
 }
 
+func TestClient_retriesALostResponseAndGetsTheReplay(t *testing.T) {
+	var calls int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch atomic.AddInt32(&calls, 1) {
+		case 1:
+			// The connection drops before a response is written.
+			hj, ok := w.(http.Hijacker)
+			if !ok {
+				t.Fatal("server does not support hijacking")
+			}
+			conn, _, _ := hj.Hijack()
+			_ = conn.Close()
+		case 2:
+			writeError(w, http.StatusGatewayTimeout, "", "")
+		case 3:
+			// The first attempt is still running on the Clara side.
+			writeError(w, http.StatusConflict, "idempotency_conflict", "A request with this Idempotency-Key is already in progress")
+		default:
+			writeJSON(w, 201, map[string]any{"data": map[string]any{"id": "int-7", "status": "active"}})
+		}
+	}))
+	defer srv.Close()
+
+	got, err := testClient(srv.URL).onboardAccount(context.Background(), onboardRequest{}, "key-1")
+	if err != nil {
+		t.Fatalf("expected the replayed result, got %v", err)
+	}
+	if got.ID != "int-7" || atomic.LoadInt32(&calls) != 4 {
+		t.Fatalf("id=%q calls=%d", got.ID, calls)
+	}
+}
+
+func TestClient_waitsLongerThanTheRetryLimitForAnInFlightRequest(t *testing.T) {
+	var calls int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if atomic.AddInt32(&calls, 1) <= maxRetries+3 {
+			writeError(w, http.StatusConflict, idempotencyConflictCode, "A request with this Idempotency-Key is already in progress")
+			return
+		}
+		writeJSON(w, 201, map[string]any{"data": map[string]any{"id": "int-8", "status": "active"}})
+	}))
+	defer srv.Close()
+
+	got, err := testClient(srv.URL).onboardAccount(context.Background(), onboardRequest{}, "k")
+	if err != nil || got.ID != "int-8" {
+		t.Fatalf("expected the replayed result after waiting, got %v", err)
+	}
+}
+
+func TestClient_reportsAnInFlightRequestThatNeverFinishes(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeError(w, http.StatusConflict, idempotencyConflictCode, "A request with this Idempotency-Key is already in progress")
+	}))
+	defer srv.Close()
+
+	_, err := testClient(srv.URL).onboardAccount(context.Background(), onboardRequest{}, "k")
+	if !isInFlight(statusOf(err), err) {
+		t.Fatalf("expected the in-flight conflict, got %v", err)
+	}
+}
+
+func TestClient_doesNotRetryADailyQuota(t *testing.T) {
+	var calls int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&calls, 1)
+		writeError(w, http.StatusTooManyRequests, "quota_exceeded", "daily limit reached")
+	}))
+	defer srv.Close()
+
+	_, err := testClient(srv.URL).onboardAccount(context.Background(), onboardRequest{}, "k")
+	if statusOf(err) != http.StatusTooManyRequests || atomic.LoadInt32(&calls) != 1 {
+		t.Fatalf("expected one attempt and a 429, got calls=%d err=%v", calls, err)
+	}
+}
+
+func TestClient_doesNotRetryAnAlreadyConnectedAccount(t *testing.T) {
+	var calls int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&calls, 1)
+		writeError(w, http.StatusConflict, "already_exists", "already connected")
+	}))
+	defer srv.Close()
+
+	_, err := testClient(srv.URL).onboardAccount(context.Background(), onboardRequest{}, "k")
+	if statusOf(err) != http.StatusConflict || atomic.LoadInt32(&calls) != 1 {
+		t.Fatalf("expected one attempt and a 409, got calls=%d err=%v", calls, err)
+	}
+}
+
 func TestClient_parsesErrorEnvelope(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusForbidden, "forbidden_scope", "Caller is missing required permissions")

@@ -24,6 +24,12 @@ Registers an AWS payer account with Clara once its AWS resources exist.
 
 Attributes are recorded when the integration is created and are not refreshed.
 
+## The ExternalId is stored in state
+
+`external_id` is marked sensitive, so Terraform hides it in plan and apply output. Like every argument, it is still written to the
+state file in plain text. Keep state in an encrypted backend with restricted access, as you would for any state that holds the
+role's trust secret.
+
 ## When verification does not pass
 
 The integration exists in Clara once the call succeeds, so a failed check is a **warning**, not an error. Failing would taint the resource, and the
