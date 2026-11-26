@@ -10,6 +10,8 @@ import (
 	"github.com/nops-io/terraform-provider-clara/internal/provider"
 )
 
+//go:generate go tool tfplugindocs generate --provider-name clara
+
 // version is set at release time with -ldflags "-X main.version=...".
 var version = "dev"
 

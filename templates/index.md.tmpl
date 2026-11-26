@@ -1,0 +1,21 @@
+---
+page_title: "Clara Provider"
+subcategory: ""
+description: |-
+  Registers AWS accounts with nOps Clara.
+---
+
+# Clara Provider
+
+Registers AWS accounts with nOps Clara. Use it with the
+[`nops-io/clara-onboarding/aws`](https://registry.terraform.io/modules/nops-io/clara-onboarding/aws) module, which creates the IAM
+role and Cost and Usage Report resources in your payer account.
+
+The provider authenticates with a Clara API key that has only the `aws-onboarding:create` permission. Create it in the AWS connect
+wizard in Clara. The key can register new AWS accounts and cannot read, change or delete anything, so every resource is create-only.
+
+## Example Usage
+
+{{ tffile "examples/provider/provider.tf" }}
+
+{{ .SchemaMarkdown | trimspace }}

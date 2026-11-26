@@ -1,0 +1,36 @@
+---
+page_title: "clara_aws_integration Resource - clara"
+subcategory: ""
+description: |-
+  Registers an AWS payer account with Clara once its AWS resources exist.
+---
+
+# clara_aws_integration (Resource)
+
+Registers an AWS payer account with Clara once its AWS resources exist.
+
+**Create-only.** The API key this provider uses can register an account and nothing else. So:
+
+- **Plan and refresh** make no requests to Clara. The state is not compared with Clara, and drift is not detected.
+- **A changed argument is refused** at plan time. Applying it could not update the integration, and replacing it would be refused as a duplicate.
+- **Destroy only forgets the resource.** The integration stays in Clara. Disconnect it there if it should go. Nothing is deleted in AWS.
+- **There is no import.**
+
+## Example Usage
+
+{{ tffile "examples/resources/clara_aws_integration/resource.tf" }}
+
+{{ .SchemaMarkdown | trimspace }}
+
+Attributes are recorded when the integration is created and are not refreshed.
+
+## When verification does not pass
+
+The integration exists in Clara once the call succeeds, so a failed check is a **warning**, not an error. Failing would taint the resource, and the
+next apply would be refused because the account is already connected. Check `verification_state`, then open the integration in Clara to see
+which checks failed and verify again.
+
+## Already onboarded
+
+If the payer account already has an integration, create fails with a message saying so. The key cannot adopt or change it. If the account was
+onboarded on purpose, remove the resource from the configuration. If it is a leftover, disconnect it in Clara first.

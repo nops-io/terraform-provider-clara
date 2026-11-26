@@ -54,10 +54,6 @@ This provider is **create-only**, because its API key is. That has consequences:
 - **Verification is a warning.** Clara checks access when it creates the integration and reports `verification_state`. A failed check does not fail the apply,
   because the integration already exists and a tainted resource could not be recreated. Check the attribute, then verify from Clara.
 
-## API contract
-
-The provider talks to the Clara routes described in [`docs/api-contract.md`](docs/api-contract.md). That file is also the specification for the Clara side.
-
 ## Development
 
 Needs Go 1.25 or newer and a `terraform` binary on `PATH` (the tests run the provider through it).
@@ -65,6 +61,15 @@ Needs Go 1.25 or newer and a `terraform` binary on `PATH` (the tests run the pro
 ```bash
 make test
 ```
+
+The Registry docs in `docs/` are generated from the schema, `templates/` and `examples/`. Regenerate them after a schema change:
+
+```bash
+go generate ./...
+```
+
+Releases are built by GoReleaser when a `v*` tag is pushed, and signed with the GPG key whose public half is registered in the
+Terraform Registry namespace.
 
 The tests use an in-memory fake of the Clara endpoint (`internal/provider/fake_clara_test.go`) that also records every request, so they can prove
 the provider sends one create and nothing else. No network or credentials are needed.

@@ -53,7 +53,7 @@ func (p *claraProvider) Schema(_ context.Context, _ provider.SchemaRequest, resp
 		Attributes: map[string]schema.Attribute{
 			"api_base_url": schema.StringAttribute{
 				Optional:    true,
-				Description: "Clara API base URL. Defaults to " + defaultAPIBaseURL + ". Can also be set with CLARA_API_URL. Must be https, except for localhost.",
+				Description: "Clara API base URL. Defaults to " + defaultAPIBaseURL + ". Can also be set with CLARA_API_URL. Must be https. Plain http is accepted only for localhost, for local testing.",
 			},
 			"api_key": schema.StringAttribute{
 				Optional:    true,
